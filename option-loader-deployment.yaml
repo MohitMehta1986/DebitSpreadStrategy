@@ -1,0 +1,74 @@
+apiVersion: "apps/v1"
+kind: "Deployment"
+metadata:
+  name: "option-loader-app"
+  namespace: "default"
+  labels:
+    app: "option-loader-app"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: "option-loader-app"
+  template:
+    metadata:
+      labels:
+        app: "option-loader-app"
+    spec:
+      containers:
+      - name: "optionloader"
+        image: "gcr.io/fifth-curve-382514/optionloader:latest"
+        env:
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: /secrets/pubsub-key.json
+        volumeMounts:
+          - name: cloud-pubsub-key
+            mountPath: /secrets/
+#      - name: cloud-sql-proxy
+#        image: gcr.io/cloudsql-docker/gce-proxy:1.28.0 # make sure the use the latest version
+#        command:
+#          - "/cloud_sql_proxy"
+#          - "-log_debug_stdout"
+#          - "-instances=fifth-curve-382514:asia-south2:options-trading=tcp:127.0.0.1:3306"
+#          - "-credential_file=/secrets/key.json"
+#        securityContext:
+#          runAsNonRoot: true
+#        volumeMounts:
+#          - name: cloud-sql-key
+#            mountPath: /secrets/
+#            readOnly: true
+
+        resources:
+          requests:
+            # The proxy's memory use scales linearly with the number of active
+            # connections. Fewer open connections will use less memory. Adjust
+            # this value based on your application's requirements.
+            memory: "512M"
+            # The proxy's CPU use scales linearly with the amount of IO between
+            # the database and the application. Adjust this value based on your
+            # application's requirements.
+            cpu:    "500m"
+      volumes:
+#        - name: cloud-sql-key
+#          secret:
+#            secretName: service-account-credentials
+        - name: cloud-pubsub-key
+          secret:
+            secretName: pubsub-key
+        # [END cloud_sql_proxy_k8s_volume_secret]
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: option-loader-app
+  namespace: default
+  clusterName: trading-app-cluster
+spec:
+  targetRef:
+    kind: Deployment
+    name: option-loader-app
+    apiVersion: apps/v1
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies: []

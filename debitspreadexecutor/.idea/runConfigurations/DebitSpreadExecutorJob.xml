@@ -1,0 +1,12 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="DebitSpreadExecutorJob" type="Application" factoryName="Application">
+    <option name="ALTERNATIVE_JRE_PATH" value="openjdk-18" />
+    <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="true" />
+    <option name="MAIN_CLASS_NAME" value="awesome.code.service.impl.StandaloneServiceLauncher" />
+    <module name="debitspread-executor" />
+    <option name="PROGRAM_PARAMETERS" value="-e dev -svc DebitSpreadExecutorJob -svi 1 -c C:\myprojects\TradingProject\debitspreadstrategyjob\debitspreadexecutor\src\main\config" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

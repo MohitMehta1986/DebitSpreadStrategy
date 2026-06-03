@@ -1,0 +1,25 @@
+steps:
+- name : bash
+  script: ls
+- name: maven:3.6.0-jdk-11-slim
+  entrypoint: 'mvn'
+  args: ['-fOptionLoader/pom.xml','clean', 'install', '-DskipTests']
+
+- name: bash  
+  script:  ls 
+    && pwd  
+    && cd OptionLoader/target
+    && ls
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'gcr.io/$PROJECT_ID/optionloader', '.']
+
+- name: "gcr.io/cloud-builders/docker"
+  args: ["push", "gcr.io/$PROJECT_ID/optionloader"]
+
+# deploy container image to GKE
+- name: "gcr.io/cloud-builders/gke-deploy"
+  args:
+    - run
+    - --filename=option-loader-deployment.yaml
+    - --location=asia-south2
+    - --cluster=trading-app-cluster
