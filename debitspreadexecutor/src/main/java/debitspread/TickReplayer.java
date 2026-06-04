@@ -102,12 +102,19 @@ public class TickReplayer {
         Logger.info(String.format("[Replayer] Chain snapshots: %d timestamps.", chainByTs.size()));
 
         // ── Build engine with replay executor (fills at recorded LTPs) ────────
-        ReplayOrderExecutor  executor   = new ReplayOrderExecutor(config);
         ReplayMarketData     marketData = new ReplayMarketData();
+        ReplayOrderExecutor  executor   = new ReplayOrderExecutor(config, marketData);
         DebitSpreadEngine    engine     = new DebitSpreadEngine(config, executor, marketData);
 
         int processed = 0;
         int skipped   = 0;
+
+        // Bug 3 fix: pre-build 5-minute OHLC candles from the full tick list so that
+        // buildTrendResult can supply real closes/highs/lows instead of a flat array.
+        // A flat array makes EMA slope = 0, candle body = 0, and VWAP-break always false —
+        // those are 3 of the 5 breakout-confirmation signals, so the engine almost never
+        // reaches the 2/5 threshold required to re-enter after the first trade.
+        List<double[]> ohlcCandles = buildOhlcCandles(ticks); // each double[4]: open,high,low,close
 
         for (TickRow tick : ticks) {
             List<ChainRow> chain = chainByTs.getOrDefault(tick.timestamp, Collections.emptyList());
@@ -119,23 +126,32 @@ public class TickReplayer {
 
             // Build OptionContract list from chain rows
             List<OptionContract> contracts = chain.stream()
-                .map(ChainRow::toOptionContract)
-                .collect(Collectors.toList());
+                    .map(ChainRow::toOptionContract)
+                    .collect(Collectors.toList());
 
             // Build MarketSnapshot
             MarketSnapshot snapshot = new MarketSnapshot(
-                tick.dateTime,
-                tick.niftySpot,
-                tick.vix,
-                tick.atm,
-                contracts
+                    tick.dateTime,
+                    tick.niftySpot,
+                    tick.vix,
+                    tick.atm,
+                    contracts
             );
 
             // Update marketData so engine's fetchLtp() returns the recorded value
             marketData.setSnapshot(snapshot);
 
+            // Determine which candles are complete up to this tick's time
+            // so the engine's indicator recomputation sees real OHLC data
+            LocalTime tickTime = tick.dateTime.toLocalTime();
+            int candlesAvailable = (int) ohlcCandles.stream()
+                    .filter(c -> c[4] < tickTime.toSecondOfDay()) // c[4] = candle end-epoch seconds
+                    .count();
+            int windowSize = Math.max(candlesAvailable, Math.max(tick.candleCount, 30));
+
             // Build fake TrendResult from recorded values (no recomputation)
-            TrendConfirmationDetector.TrendResult trend = buildTrendResult(tick, contracts);
+            TrendConfirmationDetector.TrendResult trend =
+                    buildTrendResult(tick, contracts, ohlcCandles, windowSize);
 
             // Skip FLAT ticks (engine would have been skipped in live too)
             if (trend.isFlat()) {
@@ -145,10 +161,10 @@ public class TickReplayer {
             // Call engine exactly as ZerodhaTradeEngine.handleScanning/handleInTrade does
             try {
                 engine.onTick(
-                    snapshot,
-                    trend.closes, trend.highs, trend.lows,
-                    trend.percentB, trend.adx,
-                    tick.dateTime.toLocalTime()
+                        snapshot,
+                        trend.closes, trend.highs, trend.lows,
+                        trend.percentB, trend.adx,
+                        tick.dateTime.toLocalTime()
                 );
             } catch (Exception e) {
                 Logger.warn("[Replayer] onTick error at " + tick.timestamp + ": " + e.getMessage());
@@ -215,23 +231,88 @@ public class TickReplayer {
 
     // ════════════════════════════════════════════════════════════════════════
     // TrendResult builder from recorded indicator values
-    // Reconstructs a minimal closes/highs/lows array (flat at spot price)
-    // sufficient for the engine's indicator gates to use the recorded ADX/%B
+    // Bug 3 fix: uses real OHLC candle window so the engine's internal indicator
+    // recomputation (EMA slope, candle body ratio, VWAP-break) produces live-accurate
+    // values instead of zeros from a flat array.
     // ════════════════════════════════════════════════════════════════════════
 
-    private TrendConfirmationDetector.TrendResult buildTrendResult(
-            TickRow tick, List<OptionContract> contracts) {
+    /**
+     * Builds 5-minute OHLC candles from the recorded tick stream.
+     * Returns a list where each element is double[5]: {open, high, low, close, endEpochSec}
+     * endEpochSec is the candle's close time in seconds-of-day, used to determine
+     * how many candles are complete at a given tick.
+     */
+    private List<double[]> buildOhlcCandles(List<TickRow> ticks) {
+        List<double[]> candles = new ArrayList<>();
+        if (ticks.isEmpty()) return candles;
 
-        int n = Math.max(tick.candleCount, 30);
+        final int CANDLE_MINUTES = 5;
+        double open = 0, high = 0, low = Double.MAX_VALUE, close = 0;
+        int currentBucket = -1;
+
+        for (TickRow tick : ticks) {
+            LocalTime t  = tick.dateTime.toLocalTime();
+            // minutes since midnight, rounded down to 5-min bucket
+            int bucket = (t.toSecondOfDay() / 60) / CANDLE_MINUTES;
+
+            if (currentBucket < 0) {
+                currentBucket = bucket;
+                open = high = low = close = tick.niftySpot;
+            } else if (bucket != currentBucket) {
+                // close out previous candle
+                int endSec = (currentBucket + 1) * CANDLE_MINUTES * 60;
+                candles.add(new double[]{open, high, low, close, endSec});
+                // start new candle
+                currentBucket = bucket;
+                open = high = low = close = tick.niftySpot;
+            }
+
+            // update running OHLC
+            if (tick.niftySpot > high) high = tick.niftySpot;
+            if (tick.niftySpot < low)  low  = tick.niftySpot;
+            close = tick.niftySpot;
+        }
+        // trailing partial candle (not added — it's incomplete)
+        Logger.info(String.format("[Replayer] Built %d 5-min OHLC candles from %d ticks.",
+                candles.size(), ticks.size()));
+        return candles;
+    }
+
+    private TrendConfirmationDetector.TrendResult buildTrendResult(
+            TickRow tick, List<OptionContract> contracts,
+            List<double[]> ohlcCandles, int windowSize) {
+
+        // Use real candle OHLC data for the closes/highs/lows arrays.
+        // windowSize = how many completed candles exist up to this tick.
+        int n = Math.min(windowSize, ohlcCandles.size());
+        n = Math.max(n, 30); // engine needs ≥ 30 for most indicator paths
+
         double[] closes = new double[n];
         double[] highs  = new double[n];
         double[] lows   = new double[n];
 
-        // Fill with spot price — engine's own indicator recomputation will use
-        // these but the pre-gates (ADX, %B) use the values passed as parameters
-        Arrays.fill(closes, tick.niftySpot);
-        Arrays.fill(highs,  tick.niftySpot + 5);
-        Arrays.fill(lows,   tick.niftySpot - 5);
+        if (!ohlcCandles.isEmpty()) {
+            // Take the most recent 'n' completed candles
+            int startIdx = Math.max(0, ohlcCandles.size() - n);
+            int filled   = 0;
+            for (int i = startIdx; i < ohlcCandles.size() && filled < n; i++, filled++) {
+                double[] c  = ohlcCandles.get(i);
+                closes[filled] = c[3]; // close
+                highs[filled]  = c[1]; // high
+                lows[filled]   = c[2]; // low
+            }
+            // If fewer real candles than n, pad the front with spot (warm-up guard)
+            for (int i = filled; i < n; i++) {
+                closes[i] = tick.niftySpot;
+                highs[i]  = tick.niftySpot + 5;
+                lows[i]   = tick.niftySpot - 5;
+            }
+        } else {
+            // Fallback: no candle data — fill flat (original behaviour)
+            Arrays.fill(closes, tick.niftySpot);
+            Arrays.fill(highs,  tick.niftySpot + 5);
+            Arrays.fill(lows,   tick.niftySpot - 5);
+        }
 
         // Use the recorded verdict to determine TRENDING vs FLAT
         TrendConfirmationDetector.Verdict verdict;
@@ -242,15 +323,15 @@ public class TickReplayer {
         }
 
         return new TrendConfirmationDetector.TrendResult(
-            verdict,
-            tick.adx,
-            tick.bbw,
-            tick.percentB,
-            tick.emaSlope,
-            closes, highs, lows,
-            tick.niftySpot,
-            tick.candleCount,
-            "REPLAYED"
+                verdict,
+                tick.adx,
+                tick.bbw,
+                tick.percentB,
+                tick.emaSlope,
+                closes, highs, lows,
+                tick.niftySpot,
+                tick.candleCount,
+                "REPLAYED"
         );
     }
 
@@ -280,10 +361,10 @@ public class TickReplayer {
                 DebitSpreadPosition p = positions.get(i);
                 double pnl = p.isExited() ? p.getRealisedPnl() : p.getUnrealisedPnl();
                 Logger.info(String.format(
-                    "  #%d | %s | Debit=\u20b9%.2f | P&L=\u20b9%.2f | Exit=%-16s | %s",
-                    i + 1, p.direction, p.netDebit * p.quantity,
-                    pnl, p.getExitReason(),
-                    p.isExited() ? "CLOSED" : "OPEN"));
+                        "  #%d | %s | Debit=\u20b9%.2f | P&L=\u20b9%.2f | Exit=%-16s | %s",
+                        i + 1, p.direction, p.netDebit * p.quantity,
+                        pnl, p.getExitReason(),
+                        p.isExited() ? "CLOSED" : "OPEN"));
             }
         }
         Logger.info("====================================================");
@@ -343,7 +424,7 @@ public class TickReplayer {
 
         OptionContract toOptionContract() {
             OptionContract.OptionType optType =
-                "CALL".equals(type) ? OptionContract.OptionType.CALL : OptionContract.OptionType.PUT;
+                    "CALL".equals(type) ? OptionContract.OptionType.CALL : OptionContract.OptionType.PUT;
             // Extract expiry from symbol — e.g. NIFTY2660223900PE → 26602 (YYDDMM) or similar
             String expiry = extractExpiry(symbol);
             OptionContract oc = new OptionContract(symbol, strike, optType, expiry, ltp, delta, iv);
@@ -370,37 +451,48 @@ public class TickReplayer {
     /**
      * Order executor for replay — fills at the recorded LTP in the chain snapshot.
      * No REST calls, no WebSocket, no side effects.
+     *
+     * Bug 2 fix: sellBack/buyBack now look up the exit LTP from the ReplayMarketData
+     * (which holds the current tick's snapshot) rather than leg.getContract().getLtp().
+     * The contract object was created at entry and its LTP field is frozen at entry-time
+     * price → every exit fill equalled entry fill → realisedPnl = ₹0 for every trade.
      */
     static class ReplayOrderExecutor extends ZerodhaOrderExecutor {
-        ReplayOrderExecutor(TradeConfig config) { super(config); }
+        private final ReplayMarketData marketData;
+
+        ReplayOrderExecutor(TradeConfig config, ReplayMarketData marketData) {
+            super(config);
+            this.marketData = marketData;
+        }
 
         @Override
         public TradeLeg buyOption(OptionContract option) {
             Logger.info(String.format("[REPLAY] BUY  %s @ \u20b9%.2f", option.getSymbol(), option.getLtp()));
             return new TradeLeg(option, TradeLeg.Side.BUY,
-                option.getLtp() > 0 ? 1 : 1, option.getLtp(), LocalDateTime.now());
+                    option.getLtp() > 0 ? 1 : 1, option.getLtp(), LocalDateTime.now());
         }
 
         @Override
         public TradeLeg sellOption(OptionContract option) {
             Logger.info(String.format("[REPLAY] SELL %s @ \u20b9%.2f", option.getSymbol(), option.getLtp()));
             return new TradeLeg(option, TradeLeg.Side.SELL,
-                1, option.getLtp(), LocalDateTime.now());
+                    1, option.getLtp(), LocalDateTime.now());
         }
 
         @Override
         public double sellBack(TradeLeg leg) {
-            double fill = leg.getContract().getLtp();
-            Logger.info(String.format("[REPLAY] EXIT SELL %s @ \u20b9%.2f (entry \u20b9%.2f)",
-                leg.getContract().getSymbol(), fill, leg.getEntryPrice()));
+            // fetch current-tick LTP from the live snapshot, not the entry-frozen contract
+            double fill = marketData.fetchLtp(leg.getContract());
+            Logger.info(String.format("[REPLAY] EXIT SELL %s @ ₹%.2f (entry ₹%.2f)",
+                    leg.getContract().getSymbol(), fill, leg.getEntryPrice()));
             return fill;
         }
 
         @Override
         public double buyBack(TradeLeg leg) {
-            double fill = leg.getContract().getLtp();
-            Logger.info(String.format("[REPLAY] EXIT BUY  %s @ \u20b9%.2f (entry \u20b9%.2f)",
-                leg.getContract().getSymbol(), fill, leg.getEntryPrice()));
+            double fill = marketData.fetchLtp(leg.getContract());
+            Logger.info(String.format("[REPLAY] EXIT BUY  %s @ ₹%.2f (entry ₹%.2f)",
+                    leg.getContract().getSymbol(), fill, leg.getEntryPrice()));
             return fill;
         }
     }
@@ -420,10 +512,10 @@ public class TickReplayer {
         public double fetchLtp(OptionContract contract) {
             if (current == null) return contract.getLtp();
             return current.getOptionChain().stream()
-                .filter(oc -> oc.getSymbol().equals(contract.getSymbol()))
-                .mapToDouble(OptionContract::getLtp)
-                .findFirst()
-                .orElse(contract.getLtp());
+                    .filter(oc -> oc.getSymbol().equals(contract.getSymbol()))
+                    .mapToDouble(OptionContract::getLtp)
+                    .findFirst()
+                    .orElse(contract.getLtp());
         }
 
         @Override
