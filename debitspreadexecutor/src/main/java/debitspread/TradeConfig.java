@@ -103,7 +103,7 @@ public class TradeConfig {
         double stopLossAmount      = 650.0;
         double targetProfitAmount  = 1200.0;
         int    lotSize             = 65;       // NIFTY lot size (verify current)
-        int    lots                = 2;
+        int    lots                = 4;
         String orderType           = "MARKET";
         long   pollingIntervalMs   = 5_000L;
         String marketOpenTime      = "09:15";

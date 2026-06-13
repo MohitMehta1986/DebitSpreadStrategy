@@ -893,7 +893,7 @@ public class DebitSpreadEngine {
             { 60.0, 50.0 },   // crossed 60% of max → floor = 50%
             { 75.0, 65.0 },   // crossed 75% of max → floor = 65%
     };
-    private static final double MAX_PROFIT_CAP = 1500.0;  // exit immediately at ₹1500
+    private static final double MAX_PROFIT_CAP = 2000.0;  // exit immediately at ₹1500
     private static final int    MIN_HOLD_TICKS = 3;       // trail cannot fire before this many monitor ticks
 
     private double peakPnl      = 0.0;
@@ -934,32 +934,32 @@ public class DebitSpreadEngine {
         // FIX 04: triggers are now % of maxProfitAmount (not fixed ₹ values).
         // Also retains the 40% dynamic floor from Fix 2, which now supplements the
         // %-based step table the same way it did the old ₹ table.
-        if (pnl > peakPnl) {
-            peakPnl = pnl;
-            double maxProfit     = spreadPosition.getMaxProfitAmount();
-            double dynamicFloor  = peakPnl * 0.40;   // 40% of peak always preserved
-            for (double[] step : TRAIL_STEPS_PCT) {
-                double triggerAmt = maxProfit * step[0] / 100.0;
-                double floorAmt   = maxProfit * step[1] / 100.0;
-                if (peakPnl >= triggerAmt) {
-                    double candidate = Math.max(floorAmt, dynamicFloor);
-                    if (candidate > trailFloor) {
-                        double prev = trailFloor == Double.NEGATIVE_INFINITY ? 0 : trailFloor;
-                        trailFloor  = candidate;
-                        Logger.info(String.format(
-                                "[TREND] Trail ratchet | Peak=₹%.0f crossed %.0f%%(₹%.0f) → step=₹%.0f | dyn40%%=₹%.0f → floor ₹%.0f → ₹%.0f",
-                                peakPnl, step[0], triggerAmt, floorAmt, dynamicFloor, prev, trailFloor));
-                    }
-                }
-            }
-            // Dynamic floor supplements the step table once trail is armed
-            if (trailFloor != Double.NEGATIVE_INFINITY && dynamicFloor > trailFloor) {
-                Logger.info(String.format(
-                        "[TREND] Trail dyn40%% raised floor | Peak=₹%.0f | dyn=₹%.0f > step floor=₹%.0f",
-                        peakPnl, dynamicFloor, trailFloor));
-                trailFloor = dynamicFloor;
-            }
-        }
+//        if (pnl > peakPnl) {
+//            peakPnl = pnl;
+//            double maxProfit     = spreadPosition.getMaxProfitAmount();
+//            double dynamicFloor  = peakPnl * 0.40;   // 40% of peak always preserved
+//            for (double[] step : TRAIL_STEPS_PCT) {
+//                double triggerAmt = maxProfit * step[0] / 100.0;
+//                double floorAmt   = maxProfit * step[1] / 100.0;
+//                if (peakPnl >= triggerAmt) {
+//                    double candidate = Math.max(floorAmt, dynamicFloor);
+//                    if (candidate > trailFloor) {
+//                        double prev = trailFloor == Double.NEGATIVE_INFINITY ? 0 : trailFloor;
+//                        trailFloor  = candidate;
+//                        Logger.info(String.format(
+//                                "[TREND] Trail ratchet | Peak=₹%.0f crossed %.0f%%(₹%.0f) → step=₹%.0f | dyn40%%=₹%.0f → floor ₹%.0f → ₹%.0f",
+//                                peakPnl, step[0], triggerAmt, floorAmt, dynamicFloor, prev, trailFloor));
+//                    }
+//                }
+//            }
+//            // Dynamic floor supplements the step table once trail is armed
+//            if (trailFloor != Double.NEGATIVE_INFINITY && dynamicFloor > trailFloor) {
+//                Logger.info(String.format(
+//                        "[TREND] Trail dyn40%% raised floor | Peak=₹%.0f | dyn=₹%.0f > step floor=₹%.0f",
+//                        peakPnl, dynamicFloor, trailFloor));
+//                trailFloor = dynamicFloor;
+//            }
+//        }
 
         // Hard SL = max of: 50% of max loss OR fixed -₹600 cap (Fix 3: was -₹650)
         double halfMaxLoss = -(spreadPosition.getMaxLossAmount() * (STOP_LOSS_PCT / 100.0));
