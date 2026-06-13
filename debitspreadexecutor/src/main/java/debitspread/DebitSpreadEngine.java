@@ -35,8 +35,13 @@ import java.util.stream.Collectors;/**
  *
  * ── Exit Conditions ───────────────────────────────────────────────────────
  *   • TARGET : Spread value reaches 80% of max theoretical profit
- *   • STOP   : Loss hits 50% of net debit paid
+ *   • STOP   : Loss hits -₹600 (was -₹650) OR 50% of net debit, whichever is tighter
+ *   • TRAIL  : Floor = max(ratchet step, peak × 40%) — floor can only rise
  *   • FORCE  : 15 min before market close
+ *   • COOLDOWN: 5-min re-entry block after any exit (prevents whipsaw re-entry)
+ *
+ * ── Entry Filters (additional) ────────────────────────────────────────────
+ *   • Peak profit gate: max theoretical profit ≥ ₹350 (thin spreads rejected)
  *
  * ── Usage from ZerodhaTradeEngine ────────────────────────────────────────
  *   DebitSpreadEngine spreadEngine = new DebitSpreadEngine(config, executor, marketData);
@@ -104,6 +109,23 @@ public class DebitSpreadEngine {
     private final List<DebitSpreadPosition> allPositions = new ArrayList<>(); // full history
     private boolean                      dayEnded        = false;  // set at FORCE_EXIT time
 
+    // ── Post-exit cooldown (Fix 1) ────────────────────────────────────────────
+    // After any exit (except FORCE_EXIT) a 5-minute cooldown prevents immediate
+    // re-entry into a degraded/whipsawing market. Stored as LocalTime so it
+    // integrates cleanly with the existing LocalTime-based now parameter.
+    private static final int COOLDOWN_MINUTES = 5;
+    private LocalTime lastExitTime = null;  // null = no exit yet this session
+
+    // ── %B persistence filter (FIX 03) ───────────────────────────────────────
+    // A single large candle can spike %B across the 0.60/0.40 threshold without
+    // representing a real trend. Require %B to stay in the bullish/bearish zone
+    // for at least MIN_PB_PERSIST_TICKS consecutive ticks before allowing entry.
+    // On June 3: %B jumped 0.242→0.758 in ONE candle (12:25→12:30), causing a
+    // late bullish entry into an already-completed move.
+    private static final int MIN_PB_PERSIST_TICKS = 3;
+    private int pbBullTicks = 0;  // consecutive ticks with %B >= 0.60
+    private int pbBearTicks = 0;  // consecutive ticks with %B <= 0.40
+
     public DebitSpreadEngine(TradeConfig config,
                              ZerodhaOrderExecutor executor,
                              ZerodhaMarketDataService marketData) {
@@ -140,7 +162,7 @@ public class DebitSpreadEngine {
         if (spreadPosition == null || spreadPosition.isExited()) {
             // No active position — scan for next entry
             // (re-entry allowed after exit, unlike old sessionComplete=true)
-            return tryScanAndEnter(snapshot, closes, highs, lows, percentB, adx);
+            return tryScanAndEnter(snapshot, closes, highs, lows, percentB, adx, now);
         } else {
             // Active position — monitor it
             return monitorAndExit(now, closes, highs, lows, percentB, adx);
@@ -177,16 +199,26 @@ public class DebitSpreadEngine {
 
     private boolean tryScanAndEnter(MarketSnapshot snapshot,
                                     double[] closes, double[] highs, double[] lows,
-                                    double percentB, double adx) throws IOException {
+                                    double percentB, double adx,
+                                    LocalTime now) throws IOException {
 
         double vix = snapshot.getIndiaVix();
 
         // ── Gate: Expiry day (NIFTY weekly expires every TUESDAY) ──────────
         // Use snapshot timestamp — not LocalDate.now() — so backtest works correctly.
         java.time.LocalDate candleDate = snapshot.getTimestamp().toLocalDate();
-        if (candleDate.getDayOfWeek() == DayOfWeek.TUESDAY) {
-            Logger.info("[NO-TRADE] EXPIRY DAY (Tuesday) — no new spread entries.");
-            dayEnded = true;
+//        if (candleDate.getDayOfWeek() == DayOfWeek.TUESDAY) {
+//            Logger.info("[NO-TRADE] EXPIRY DAY (Tuesday) — no new spread entries.");
+//            dayEnded = true;
+//            return false;
+//        }
+
+        // ── Fix 1: 5-minute cooldown after any exit ───────────────────────────
+        // Prevents re-entry into a market still whipsawing from the just-exited move.
+        // lastExitTime is set by exitSpread() for every non-FORCE_EXIT exit.
+        if (lastExitTime != null && now.isBefore(lastExitTime.plusMinutes(COOLDOWN_MINUTES))) {
+            Logger.debug(String.format("[COOLDOWN] %d-min cooldown active — last exit=%s, now=%s. Skip.",
+                    COOLDOWN_MINUTES, lastExitTime, now));
             return false;
         }
 
@@ -274,23 +306,41 @@ public class DebitSpreadEngine {
             return false;
         }
 
-        // ── Rec #6: EMA slope — secondary confirmation ───────────────────────
-        // ADX is the primary trend strength gate. When ADX >= 23 the trend is
-        // confirmed independently; slope only adds noise at that point.
-        // Slope gate is enforced ONLY when ADX is in the borderline zone (18–22)
-        // where trend strength is developing and slope provides useful extra signal.
+        // ── Rec #6: EMA slope — secondary confirmation (FIX 02: graduated bypass) ──
+        //
+        // OLD: binary adxStrong (adx ≥ 23) fully bypassed the slope gate.
+        //   This allowed slope=+0.0009 (noise) to pass at adx=23.74 on June 3 12:35,
+        //   resulting in a late bullish entry into an already-completed move.
+        //
+        // NEW: three-tier graduated gate:
+        //   adx < 23           → full gate: |slope| > 0.010 %/candle
+        //   adx 23–27 (border) → relaxed:   |slope| > 0.004 %/candle  (was fully bypassed)
+        //   adx ≥ 28  (strong) → bypass entirely — ADX alone confirms trend
         //
         // On 5-min NIFTY ~24000:
-        //   0.008% = ~10 pt EMA move over 5 candles (weak but real with ADX=28)
-        //   0.010% = ~12 pt move (threshold would block valid bearish entries)
+        //   0.004% ≈ ~1 pt EMA move per candle — filters noise but passes real momentum
+        //   0.010% ≈ ~2.4 pt per candle — full-gate threshold for weak ADX
         double emaSlope    = computeEmaSlope(closes, 20);
         boolean slopeReady = closes.length >= 25; // period(20) + 5 lookahead
-        boolean adxStrong  = adx >= 23.0;         // ADX >= 23 = confirmed trend, skip slope gate
 
-        if (slopeReady && !adxStrong && Math.abs(emaSlope) < EMA_SLOPE_STRONG_THRESHOLD) {
+        // FIX 02: graduated threshold replaces binary adxStrong flag
+        double slopeThreshold;
+        boolean slopeBypassed;
+        if (adx >= 28.0) {
+            slopeBypassed  = true;
+            slopeThreshold = 0.0;   // fully bypassed at strong ADX
+        } else if (adx >= 23.0) {
+            slopeBypassed  = false;
+            slopeThreshold = 0.004; // relaxed gate in borderline ADX zone
+        } else {
+            slopeBypassed  = false;
+            slopeThreshold = EMA_SLOPE_STRONG_THRESHOLD; // full gate at weak ADX
+        }
+
+        if (slopeReady && !slopeBypassed && Math.abs(emaSlope) < slopeThreshold) {
             Logger.info(String.format(
-                    "[WARN]  EMA slope=%.3f%% below %.3f%% and ADX=%.1f borderline — skip.",
-                    emaSlope, EMA_SLOPE_STRONG_THRESHOLD, adx));
+                    "[WARN]  EMA slope=%.4f%% below threshold %.4f%% (ADX=%.1f tier) — skip.",
+                    emaSlope, slopeThreshold, adx));
             if (scanState == ScanState.BREAKOUT_CONFIRMED) {
                 scanState = ScanState.SCANNING;
                 java.util.Arrays.fill(breakoutWindow, 0);
@@ -298,12 +348,17 @@ public class DebitSpreadEngine {
             }
             return false;
         }
+        // Keep the adxStrong boolean for downstream slope-alignment check (same logic)
+        boolean adxStrong = slopeBypassed;
         if (!slopeReady) {
             Logger.debug(String.format(
                     "[INFO]  EMA slope skipped (%d/25 candles) — ADX+%%B gate active.", closes.length));
         } else if (adxStrong) {
             Logger.debug(String.format(
-                    "[INFO]  EMA slope=%.3f%% noted — slope gate bypassed (ADX=%.1f >= 23).", emaSlope, adx));
+                    "[INFO]  EMA slope=%.4f%% noted — slope gate bypassed (ADX=%.1f ≥ 28).", emaSlope, adx));
+        } else {
+            Logger.debug(String.format(
+                    "[INFO]  EMA slope=%.4f%% passed threshold %.4f%% (ADX=%.1f).", emaSlope, slopeThreshold, adx));
         }
 
         // ── Direction detection ───────────────────────────────────────────────
@@ -332,22 +387,42 @@ public class DebitSpreadEngine {
             }
         }
 
-        // Gate: %B must align with direction
-        // SKIP on BREAKOUT_CONFIRMED path — direction was committed during compression
-        // detection (pendingBias). %B near 0.50 at breakout time is normal; the squeeze
-        // hasn't resolved yet. Checking %B here blocks every valid breakout entry.
+        // Gate: %B must align with direction AND persist for MIN_PB_PERSIST_TICKS ticks
+        // SKIP on BREAKOUT_CONFIRMED path — %B near 0.50 at breakout time is normal.
         //
-        // FIX #3: Tightened from >= 0.50 / <= 0.50 to >= 0.60 / <= 0.40.
-        // The original threshold (midband) allowed entries at neutral %B with zero
-        // bullish/bearish edge. A bull spread entered at %B=0.51 sits right at the
-        // moving average with equal probability of moving either way — not a bullish
-        // setup. Require price to be meaningfully in the upper/lower half before entry.
+        // FIX 03: Added persistence requirement (≥ 3 consecutive ticks).
+        // A single large candle can spike %B from 0.24 → 0.76 in one bar without
+        // representing a real trend (June 3 12:25→12:30: +67pt candle caused this).
+        // Require the threshold to hold for MIN_PB_PERSIST_TICKS consecutive ticks
+        // before treating it as a valid directional signal.
+        //
+        // The counters (pbBullTicks / pbBearTicks) are updated every tick regardless of
+        // other gate outcomes, so they reflect the real %B history. They reset when %B
+        // exits the zone, ensuring the persistence window is always fresh.
+        if (percentB >= 0.60) {
+            pbBullTicks++;
+            pbBearTicks = 0;
+        } else if (percentB <= 0.40) {
+            pbBearTicks++;
+            pbBullTicks = 0;
+        } else {
+            pbBullTicks = 0;
+            pbBearTicks = 0;
+        }
+
         if (scanState != ScanState.BREAKOUT_CONFIRMED) {
-            boolean pbAligned = (dirBias == Bias.BULLISH && percentB >= 0.60)
-                    || (dirBias == Bias.BEARISH && percentB <= 0.40);
+            boolean pbAligned;
+            if (dirBias == Bias.BULLISH) {
+                pbAligned = (percentB >= 0.60) && (pbBullTicks >= MIN_PB_PERSIST_TICKS);
+            } else {
+                pbAligned = (percentB <= 0.40) && (pbBearTicks >= MIN_PB_PERSIST_TICKS);
+            }
             if (!pbAligned) {
-                Logger.info(String.format("[NO-TRADE] %%B=%.2f misaligns with %s (need ≥0.60 bull / ≤0.40 bear). Skip.",
-                        percentB, dirBias));
+                int ticks = dirBias == Bias.BULLISH ? pbBullTicks : pbBearTicks;
+                Logger.info(String.format(
+                        "[NO-TRADE] %%B=%.2f misaligns or not yet persistent for %s " +
+                                "(need ≥0.60 bull/≤0.40 bear × %d ticks, current=%d ticks). Skip.",
+                        percentB, dirBias, MIN_PB_PERSIST_TICKS, ticks));
                 scanState = ScanState.SCANNING;
                 return false;
             }
@@ -500,42 +575,60 @@ public class DebitSpreadEngine {
     /**
      * Determines market direction using 4 indicators:
      *
-     *   1. EMA Cross (EMA9 vs EMA21)         weight 35
-     *   2. ADX +DI vs -DI                    weight 30
-     *   3. %B position (upper/lower half)    weight 20
-     *   4. Price vs EMA20                    weight 15
+     *   EMA cross available (n ≥ 21):
+     *     1. EMA Cross (EMA9 vs EMA21)         weight 35
+     *     2. ADX +DI vs -DI                    weight 30
+     *     3. %B position (upper/lower half)    weight 20
+     *     4. Price vs EMA20                    weight 15
+     *
+     *   EMA warmup (n < 21) — FIX 01:
+     *     EMA21 is not yet meaningful when fewer than 21 candles exist.
+     *     Using it produced a spurious BULLISH bias during the early session
+     *     (EMA9 ≈ EMA21 ≈ last close → EMA9 > EMA21 by noise → +35 bull always).
+     *     When n < 21, skip the EMA cross entirely and redistribute its 35-weight
+     *     to DI lines (total DI weight becomes 65), keeping total = 100.
      */
     private DirectionSignal detectDirection(double[] closes, double[] highs,
                                             double[] lows, double percentB,
                                             double adx) {
         int n = closes.length;
-        if (n < 21) return new DirectionSignal(Bias.BULLISH, 0, "Insufficient candles.");
+        if (n < 9) return new DirectionSignal(Bias.BULLISH, 0, "Insufficient candles.");
 
         int bullScore = 0;
         int bearScore = 0;
         StringBuilder reason = new StringBuilder();
 
-        // 1. EMA9 vs EMA21 — weight 35
-        double ema9  = computeEma(closes, 9);
-        double ema21 = computeEma(closes, 21);
-        if (ema9 > ema21) {
-            bullScore += 35;
-            reason.append(String.format("EMA9>EMA21(%.0f>%.0f)=BULL ", ema9, ema21));
+        // FIX 01: EMA cross only when EMA21 has enough data to be meaningful.
+        // Before candle 21 the warmup bias locked direction=BULLISH for the entire
+        // early bearish window (10:55–11:39 on June 3), blocking every valid entry.
+        boolean emaReady = (n >= 21);
+
+        if (emaReady) {
+            // 1. EMA9 vs EMA21 — weight 35
+            double ema9  = computeEma(closes, 9);
+            double ema21 = computeEma(closes, 21);
+            if (ema9 > ema21) {
+                bullScore += 35;
+                reason.append(String.format("EMA9>EMA21(%.0f>%.0f)=BULL ", ema9, ema21));
+            } else {
+                bearScore += 35;
+                reason.append(String.format("EMA9<EMA21(%.0f<%.0f)=BEAR ", ema9, ema21));
+            }
         } else {
-            bearScore += 35;
-            reason.append(String.format("EMA9<EMA21(%.0f<%.0f)=BEAR ", ema9, ema21));
+            reason.append(String.format("EMA_WARMUP(n=%d<21)=SKIP ", n));
         }
 
-        // 2. +DI vs -DI — weight 30
+        // 2. +DI vs -DI — weight 30 normally; 65 when EMA is in warmup (FIX 01)
+        int diWeight = emaReady ? 30 : 65;
         double[] di    = computeDiLines(highs, lows, closes, 14);
         double plusDI  = di[0];
         double minusDI = di[1];
         if (plusDI > minusDI) {
-            bullScore += 30;
-            reason.append(String.format("+DI>-DI(%.1f>%.1f)=BULL ", plusDI, minusDI));
+            bullScore += diWeight;
+            reason.append(String.format("+DI>-DI(%.1f>%.1f)=BULL(w%d) ", plusDI, minusDI, diWeight));
         } else {
-            bearScore += 30;
-            reason.append(String.format("-DI>+DI(%.1f>%.1f)=BEAR ", minusDI, plusDI));
+            bearScore += diWeight;
+            reason.append(String.format("-DI>+DI(%.1f>%.1f)=BEAR(w%d) ", minusDI, plusDI, diWeight));
         }
 
         // 3. %B — weight 20
@@ -631,6 +724,14 @@ public class DebitSpreadEngine {
         return findBestSpread(puts, false);
     }
 
+    // ── Fix 4: Minimum peak profit gate ──────────────────────────────────────
+    // Skip entries where max theoretical profit for the full position is below
+    // ₹350. Such spreads have too little headroom to clear brokerage + slippage
+    // (≈ ₹200 round-trip) and still deliver a meaningful reward-to-risk outcome.
+    // Evaluated using config.lots × config.lotSize so it respects VIX-reduced qty;
+    // thin markets where strikeWidth is tiny or IV has collapsed are filtered here.
+    private static final double MIN_PEAK_PROFIT = 350.0;
+
     private Optional<SpreadLegs> findBestSpread(List<OptionContract> options,
                                                 boolean isCallSpread) {
         SpreadLegs best = null;
@@ -658,6 +759,20 @@ public class DebitSpreadEngine {
                 if (legs.netDebit / legs.strikeWidth > MAX_DEBIT_RATIO) continue;
                 if (legs.rrRatio < MIN_RR_RATIO) continue;
 
+                // Fix 4: ADX peak-profit gate — skip spreads too thin to be worthwhile.
+                // maxProfitPer × baseQty gives the ₹ ceiling for this specific spread;
+                // if it cannot reach MIN_PEAK_PROFIT (₹350) there is no real R:R edge
+                // once brokerage (≈₹200 round-trip) is deducted.
+                int baseQty = config.lots * config.lotSize;
+                double maxProfitAmount = (legs.strikeWidth - legs.netDebit) * baseQty;
+                if (maxProfitAmount < MIN_PEAK_PROFIT) {
+                    Logger.debug(String.format(
+                            "  [SKIP] Peak profit ₹%.0f < ₹%.0f gate (width=%.0f debit=%.2f qty=%d).",
+                            maxProfitAmount, MIN_PEAK_PROFIT,
+                            legs.strikeWidth, legs.netDebit, baseQty));
+                    continue;
+                }
+
                 // Score: prefer delta closest to ideal midpoints + best R:R
                 double score = legs.rrRatio * 10
                         - Math.abs(longLeg.getAbsDelta()  - 0.50) * 20
@@ -673,8 +788,9 @@ public class DebitSpreadEngine {
         if (best != null) {
             Logger.info("[OK] Spread selected: " + best);
         } else {
-            Logger.info("❌ No spread met R:R criteria (min R:R=" + MIN_RR_RATIO +
-                    ", maxDebitRatio=" + MAX_DEBIT_RATIO + ")");
+            Logger.info("❌ No spread met entry criteria (min R:R=" + MIN_RR_RATIO +
+                    ", maxDebitRatio=" + MAX_DEBIT_RATIO +
+                    ", minPeakProfit=₹" + (int) MIN_PEAK_PROFIT + ")");
         }
 
         return Optional.ofNullable(best);
@@ -706,7 +822,10 @@ public class DebitSpreadEngine {
 
         peakPnl       = 0.0;
         trailFloor    = Double.NEGATIVE_INFINITY;
+        holdTickCount = 0;
         reversalCount = 0;
+        pbBullTicks   = 0;
+        pbBearTicks   = 0;
         entryBias     = direction == DebitSpreadPosition.Direction.BULL_CALL_SPREAD ? Bias.BULLISH : Bias.BEARISH;
 
         spreadPosition = new DebitSpreadPosition(
@@ -721,23 +840,25 @@ public class DebitSpreadEngine {
 
         Logger.info(String.format(
                 "[OK] %s ENTERED | Long=%.0f@₹%.2f | Short=%.0f@₹%.2f | NetDebit=₹%.2f | " +
-                        "MaxProfit=₹%.2f | MaxLoss=₹%.2f | Trail arms at ₹%.0f",
+                        "MaxProfit=₹%.2f | MaxLoss=₹%.2f | Trail arms at %.0f%% of max (₹%.0f)",
                 direction,
                 legs.longLeg.getStrikePrice(),  longFill.getEntryPrice(),
                 legs.shortLeg.getStrikePrice(), shortFill.getEntryPrice(),
                 actualDebit * effectiveQty,
                 spreadPosition.getMaxProfitAmount(),
                 spreadPosition.getMaxLossAmount(),
-                TRAIL_STEPS[0][0]
+                TRAIL_STEPS_PCT[0][0],
+                spreadPosition.getMaxProfitAmount() * TRAIL_STEPS_PCT[0][0] / 100.0
         ));
     }
 
     private void logMonitorStatus(double pnl, double profitPct,
                                   double exitFloor, double longLtp, double shortLtp) {
         String trend     = pnl >= 0 ? "▲" : "▼";
+        double armAt     = spreadPosition.getMaxProfitAmount() * TRAIL_STEPS_PCT[0][0] / 100.0;
         String trailInfo = trailFloor == Double.NEGATIVE_INFINITY
-                ? String.format("Trail=ARMED@₹%.0f (need ₹%.0f more)",
-                TRAIL_STEPS[0][0], TRAIL_STEPS[0][0] - Math.max(peakPnl, 0))
+                ? String.format("Trail=ARMED@₹%.0f (need ₹%.0f more, hold=%d/%d)",
+                armAt, Math.max(armAt - peakPnl, 0), holdTickCount, MIN_HOLD_TICKS)
                 : String.format("Trail=LOCKED | Floor=₹%.0f | Peak=₹%.0f",
                 trailFloor, peakPnl);
 
@@ -748,21 +869,36 @@ public class DebitSpreadEngine {
                 exitFloor, trailInfo, reversalCount));
     }
 
-    // ── Trailing stop state — ₹-based ladder ─────────────────────────────────
-    // Arms at ₹200 profit (covers brokerage ≈ ₹200 round-trip).
-    // Floor ratchets up in steps — never moves down.
+    // ── Trailing stop state — dynamic % of max-profit ladder (FIX 04) ───────
     //
-    // { peak_trigger_₹, exit_floor_₹ }
-    private static final double[][] TRAIL_STEPS = {
-            {  200,    0 },   // crossed ₹200 → floor = ₹0     (at least break even)
-            {  500,  300 },   // crossed ₹500 → floor = ₹300
-            { 1000,  800 },   // crossed ₹1000 → floor = ₹800
-            { 1200, 1000 },   // crossed ₹1200 → floor = ₹1000
+    // OLD: fixed ₹ triggers (₹200, ₹500, ₹1000, ₹1200).
+    //   For a 250-pt-wide bear put (max profit ₹12116), ₹200 trigger was only 1.6%
+    //   of max profit — trail fired on noise, exiting Trade 1 at ₹0 instead of ₹908.
+    //
+    // NEW: triggers expressed as % of getMaxProfitAmount() (computed at entry).
+    //   This scales correctly regardless of spread width, IV level, or lot size.
+    //
+    //   { trigger_pct, floor_pct }   (percentages of maxProfitAmount)
+    //   e.g. for ₹12116 max:  15% = ₹1817 trigger | 0% = ₹0 floor (break-even)
+    //                          35% = ₹4241 trigger | 20% = ₹2423 floor
+    //                          60% = ₹7270 trigger | 50% = ₹6058 floor
+    //                          75% = ₹9087 trigger | 65% = ₹7875 floor
+    //
+    // FIX 04b: MIN_HOLD_TICKS — trail cannot fire for the first 3 ticks after entry
+    //   (~15 min on 5-min candles). Many spreads need settling time before the trend
+    //   unfolds; the ₹200 trigger was firing during initial noise on June 3 Trade 1.
+    private static final double[][] TRAIL_STEPS_PCT = {
+            { 15.0,  0.0 },   // crossed 15% of max → floor = 0%  (break-even protected)
+            { 35.0, 20.0 },   // crossed 35% of max → floor = 20%
+            { 60.0, 50.0 },   // crossed 60% of max → floor = 50%
+            { 75.0, 65.0 },   // crossed 75% of max → floor = 65%
     };
     private static final double MAX_PROFIT_CAP = 1500.0;  // exit immediately at ₹1500
+    private static final int    MIN_HOLD_TICKS = 3;       // trail cannot fire before this many monitor ticks
 
-    private double peakPnl    = 0.0;
-    private double trailFloor = Double.NEGATIVE_INFINITY;  // -∞ = trail not armed
+    private double peakPnl      = 0.0;
+    private double trailFloor   = Double.NEGATIVE_INFINITY;  // -∞ = trail not armed
+    private int    holdTickCount = 0;  // incremented each monitorAndExit tick; trail blocked until MIN_HOLD_TICKS
 
     // ── IN_TRADE — Monitor and exit ───────────────────────────────────────────
 
@@ -787,29 +923,47 @@ public class DebitSpreadEngine {
             Logger.warn(String.format(
                     "🚨 VIX SPIKE EXIT | VIX=%.2f ≥ %.0f — exiting to cap IV loss. PnL=₹%.2f",
                     liveVix, VIX_EMERGENCY_EXIT, pnl));
-            exitSpread(DebitSpreadPosition.ExitReason.STOP_LOSS);
+            exitSpread(DebitSpreadPosition.ExitReason.STOP_LOSS, now);
             return true;
         }
 
+        // ── FIX 04: MIN_HOLD_TICKS guard — trail cannot fire in first N ticks ──
+        holdTickCount++;
+
         // ── Ratchet trail floor up when new PnL peak hit ──────────────────────
+        // FIX 04: triggers are now % of maxProfitAmount (not fixed ₹ values).
+        // Also retains the 40% dynamic floor from Fix 2, which now supplements the
+        // %-based step table the same way it did the old ₹ table.
         if (pnl > peakPnl) {
             peakPnl = pnl;
-            for (double[] step : TRAIL_STEPS) {
-                double trigger = step[0];
-                double floor   = step[1];
-                if (peakPnl >= trigger && floor > trailFloor) {
-                    double prev = trailFloor == Double.NEGATIVE_INFINITY ? 0 : trailFloor;
-                    trailFloor  = floor;
-                    Logger.info(String.format(
-                            "[TREND] Trail ratchet | Peak=₹%.0f crossed ₹%.0f → floor ₹%.0f → ₹%.0f",
-                            peakPnl, trigger, prev, trailFloor));
+            double maxProfit     = spreadPosition.getMaxProfitAmount();
+            double dynamicFloor  = peakPnl * 0.40;   // 40% of peak always preserved
+            for (double[] step : TRAIL_STEPS_PCT) {
+                double triggerAmt = maxProfit * step[0] / 100.0;
+                double floorAmt   = maxProfit * step[1] / 100.0;
+                if (peakPnl >= triggerAmt) {
+                    double candidate = Math.max(floorAmt, dynamicFloor);
+                    if (candidate > trailFloor) {
+                        double prev = trailFloor == Double.NEGATIVE_INFINITY ? 0 : trailFloor;
+                        trailFloor  = candidate;
+                        Logger.info(String.format(
+                                "[TREND] Trail ratchet | Peak=₹%.0f crossed %.0f%%(₹%.0f) → step=₹%.0f | dyn40%%=₹%.0f → floor ₹%.0f → ₹%.0f",
+                                peakPnl, step[0], triggerAmt, floorAmt, dynamicFloor, prev, trailFloor));
+                    }
                 }
+            }
+            // Dynamic floor supplements the step table once trail is armed
+            if (trailFloor != Double.NEGATIVE_INFINITY && dynamicFloor > trailFloor) {
+                Logger.info(String.format(
+                        "[TREND] Trail dyn40%% raised floor | Peak=₹%.0f | dyn=₹%.0f > step floor=₹%.0f",
+                        peakPnl, dynamicFloor, trailFloor));
+                trailFloor = dynamicFloor;
             }
         }
 
-        // Hard SL = max of: 50% of max loss OR fixed ₹650 cap
+        // Hard SL = max of: 50% of max loss OR fixed -₹600 cap (Fix 3: was -₹650)
         double halfMaxLoss = -(spreadPosition.getMaxLossAmount() * (STOP_LOSS_PCT / 100.0));
-        double hardSl      = Math.max(halfMaxLoss, -650.0);
+        double hardSl      = Math.max(halfMaxLoss, -600.0);
 
         // Effective exit floor = highest of hard SL and trail floor
         double exitFloor = trailFloor == Double.NEGATIVE_INFINITY
@@ -820,21 +974,21 @@ public class DebitSpreadEngine {
 
         // ── 1. Force exit ─────────────────────────────────────────────────────
         if (now.isAfter(FORCE_EXIT_TIME)) {
-            exitSpread(DebitSpreadPosition.ExitReason.FORCE_EXIT);
+            exitSpread(DebitSpreadPosition.ExitReason.FORCE_EXIT, now);
             return true;
         }
 
         // ── 2. Max profit cap (₹1500) ─────────────────────────────────────────
         if (pnl >= MAX_PROFIT_CAP) {
             Logger.info(String.format("🎯 MAX CAP | PnL=₹%.2f ≥ ₹%.0f", pnl, MAX_PROFIT_CAP));
-            exitSpread(DebitSpreadPosition.ExitReason.TARGET_PROFIT);
+            exitSpread(DebitSpreadPosition.ExitReason.TARGET_PROFIT, now);
             return true;
         }
 
         // ── 3. Target profit (80% of theoretical max) ─────────────────────────
         if (profitPct >= PROFIT_TARGET_PCT) {
             Logger.info(String.format("🎯 SPREAD TARGET | PnL=₹%.2f | %.0f%% of max", pnl, profitPct));
-            exitSpread(DebitSpreadPosition.ExitReason.TARGET_PROFIT);
+            exitSpread(DebitSpreadPosition.ExitReason.TARGET_PROFIT, now);
             return true;
         }
 
@@ -851,7 +1005,7 @@ public class DebitSpreadEngine {
                         reversalCount, entryBias, currentDir.bias, currentDir.confidence, pnl));
                 if (reversalCount >= 2) {
                     Logger.warn("🔄 TREND REVERSAL CONFIRMED — exiting.");
-                    exitSpread(DebitSpreadPosition.ExitReason.TREND_REVERSAL);
+                    exitSpread(DebitSpreadPosition.ExitReason.TREND_REVERSAL, now);
                     return true;
                 }
             } else if (reversalCount > 0) {
@@ -861,8 +1015,14 @@ public class DebitSpreadEngine {
         }
 
         // ── 5. Trailing stop / hard SL ────────────────────────────────────────
-        if (pnl <= exitFloor) {
-            if (trailFloor != Double.NEGATIVE_INFINITY && pnl > hardSl) {
+        // FIX 04b: trail cannot fire before MIN_HOLD_TICKS ticks have elapsed.
+        // Hard SL (-₹600 / 50%) can still fire immediately to cap catastrophic losses.
+        boolean trailCanFire = (holdTickCount >= MIN_HOLD_TICKS);
+        boolean trailTripped = (trailFloor != Double.NEGATIVE_INFINITY) && pnl <= trailFloor;
+        boolean hardSlTripped = pnl <= hardSl;
+
+        if (hardSlTripped || (trailCanFire && trailTripped)) {
+            if (!hardSlTripped && trailTripped) {
                 Logger.warn(String.format(
                         "🛡 TRAIL STOP | PnL=₹%.2f ≤ floor=₹%.0f | Peak=₹%.0f | Brokerage protected.",
                         pnl, trailFloor, peakPnl));
@@ -870,8 +1030,13 @@ public class DebitSpreadEngine {
                 Logger.warn(String.format(
                         "🛑 STOP-LOSS | PnL=₹%.2f ≤ floor=₹%.0f", pnl, exitFloor));
             }
-            exitSpread(DebitSpreadPosition.ExitReason.STOP_LOSS);
+            exitSpread(DebitSpreadPosition.ExitReason.STOP_LOSS, now);
             return true;
+        }
+        if (!trailCanFire && trailTripped) {
+            Logger.debug(String.format(
+                    "[HOLD] Trail floor=₹%.0f breached but MIN_HOLD_TICKS not met (%d/%d) — holding.",
+                    trailFloor, holdTickCount, MIN_HOLD_TICKS));
         }
 
         return true;
@@ -882,6 +1047,17 @@ public class DebitSpreadEngine {
     // ════════════════════════════════════════════════════════════════════════
 
     private void exitSpread(DebitSpreadPosition.ExitReason reason) throws IOException, KiteException {
+        exitSpread(reason, null);
+    }
+
+    /**
+     * @param tickTime  the market LocalTime of the current tick — used as the
+     *                  cooldown anchor so replay (which calls LocalDateTime.now()
+     *                  at wall-clock time, not market time) produces correct cooldowns.
+     *                  Pass null to fall back to wall-clock (live mode only).
+     */
+    private void exitSpread(DebitSpreadPosition.ExitReason reason,
+                            LocalTime tickTime) throws IOException, KiteException {
         Logger.info("◀ Exiting spread. Reason: " + reason);
         marketData.stopTicker();
 
@@ -913,6 +1089,15 @@ public class DebitSpreadEngine {
         // Mark day ended only on FORCE_EXIT — all other exits allow re-entry
         if (reason == DebitSpreadPosition.ExitReason.FORCE_EXIT) {
             dayEnded = true;
+        } else {
+            // Fix (replay bug 1): use the tick's market time as the cooldown anchor.
+            // In live mode tickTime == null → fall back to wall clock (same as before).
+            // In replay mode LocalDateTime.now() is wall-clock (e.g. 22:02), so without
+            // this fix the cooldown would arm at 22:02 and block every remaining tick
+            // whose market LocalTime is between 09:00–15:30 (all of them → 0 re-entries).
+            lastExitTime = (tickTime != null) ? tickTime : LocalDateTime.now().toLocalTime();
+            Logger.info(String.format("[COOLDOWN] Exit recorded at %s — re-entry blocked until %s.",
+                    lastExitTime, lastExitTime.plusMinutes(COOLDOWN_MINUTES)));
         }
 
         // Log trade result + running session total
