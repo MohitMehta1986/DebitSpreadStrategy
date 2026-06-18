@@ -100,7 +100,7 @@ public class TradeConfig {
         double targetDelta         = 0.225;   // midpoint of 0.20–0.25
         double deltaRange          = 0.015;   // ±0.015 → [0.20, 0.23]
         double maxDeltaDifference  = 0.03;
-        double stopLossAmount      = 650.0;
+        double stopLossAmount      = 1000.0;
         double targetProfitAmount  = 1200.0;
         int    lotSize             = 65;       // NIFTY lot size (verify current)
         int    lots                = 4;
@@ -109,7 +109,7 @@ public class TradeConfig {
         String marketOpenTime      = "09:15";
         String marketCloseTime     = "15:15";
         int    forceExitMinutesBeforeClose = 15;
-        String tradeUrl = "http://localhost:9002/";
+        String tradeUrl = "http://localhost:9003/";
 
         public Builder userIds(List<String> v)           { this.userIds = v; return this; }
         public Builder vixNoTradeThreshold(double v) { this.vixNoTradeThreshold = v; return this; }

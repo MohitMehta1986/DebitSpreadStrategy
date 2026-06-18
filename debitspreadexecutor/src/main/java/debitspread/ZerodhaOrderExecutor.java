@@ -87,7 +87,7 @@ public class ZerodhaOrderExecutor {
         //postOrder(symbol, "BUY", qty);
 
         //TODO: Uncomment while doing actual trade
-        double fill = leg.getExitPrice(); //pollFillPrice(symbol, true);
+        double fill = leg.getContract().getLtp(); //pollFillPrice(symbol, true);
 
         Logger.info(String.format("   Exit fill: ₹%.2f (entry was ₹%.2f)",
                 fill, leg.getEntryPrice()));
@@ -111,7 +111,7 @@ public class ZerodhaOrderExecutor {
         //postOrder(symbol, "SELL", qty);
 
         //TODO: Uncomment while doing actual trade
-        double fill = leg.getExitPrice(); //pollFillPrice(symbol, false);
+        double fill = leg.getContract().getLtp(); //pollFillPrice(symbol, false);
 
         Logger.info(String.format("   Exit fill: ₹%.2f (entry was ₹%.2f)",
                 fill, leg.getEntryPrice()));

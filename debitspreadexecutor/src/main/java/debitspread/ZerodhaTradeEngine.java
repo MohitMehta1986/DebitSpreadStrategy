@@ -36,10 +36,6 @@ public class ZerodhaTradeEngine {
 
     private State            state    = State.IDLE;
 
-    // ── Short strangle position + monitor (debit spread uses DebitSpreadEngine) ──
-    private final PortfolioMonitor   monitor;
-    private       Position           position = null;
-
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
     public ZerodhaTradeEngine(TradeConfig config, KiteConnect kite) {
@@ -49,7 +45,6 @@ public class ZerodhaTradeEngine {
         this.executor   = new ZerodhaOrderExecutor(config);
         this.trendDetector = new TrendConfirmationDetector(kite);
         this.spreadEngine  = new DebitSpreadEngine(config, executor, marketData);
-        this.monitor       = new PortfolioMonitor(config);
         this.tickRecorder  = new TickRecorder();
     }
 
@@ -58,12 +53,6 @@ public class ZerodhaTradeEngine {
      */
     public void initialize() throws KiteException, IOException {
         marketData.initialize();
-
-        // ── Market Regime Check ────────────────────────────────────────────
-        // Evaluate market conditions before committing to trade today.
-        // AVOID verdict stops the engine before any order is placed.
-
-
         try {
             trendDetector.initialize();
         } catch (Exception e) {
@@ -105,7 +94,6 @@ public class ZerodhaTradeEngine {
 
     public void stop() {
         Logger.info("Stop requested.");
-
 
         // Force-exit open spread position
         if (spreadEngine.hasActivePosition()) {
@@ -247,45 +235,8 @@ public class ZerodhaTradeEngine {
             }
             return;
         }
-
-        // ── Short strangle / straddle position monitoring ────────────────────
-        // position is null unless a strangle/straddle was opened earlier this session
-        if (position == null || position.isExited()) {
-            Logger.debug("[IN_TRADE] No strangle position active — nothing to monitor.");
-            state = State.SCANNING;
-            return;
-        }
-
-        // Force-exit check (market closing soon)
-        Position.ExitReason forceExit = monitor.evaluateForceExit(position, isMarketClosingSoon(now));
-        if (forceExit != Position.ExitReason.NONE) {
-            exitTrade(forceExit);
-            return;
-        }
-
-        // P&L-based exit
-        Position.ExitReason reason = monitor.evaluate(position);
-        if (reason != Position.ExitReason.NONE) {
-            exitTrade(reason);
-        }
     }
 
-
-    private void exitTrade(Position.ExitReason reason) throws IOException {
-        Logger.info("[EXIT] Exiting strangle position. Reason: " + reason);
-
-        marketData.stopTicker();
-
-        double callExit = executor.buyBack(position.getCallLeg());
-        double putExit  = executor.buyBack(position.getPutLeg());
-
-        position.markExited(callExit, putExit, reason, java.time.LocalDateTime.now());
-        monitor.resetForNewPosition(); // reset trail floor for next position
-        state = State.EXITED;
-
-        Logger.info(String.format("[EXIT] DONE | Reason=%s | PnL=₹%.2f",
-                reason, position.getTotalRealisedPnl()));
-    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Helpers
@@ -295,11 +246,6 @@ public class ZerodhaTradeEngine {
         LocalTime open  = LocalTime.parse(config.marketOpenTime, TIME_FMT);
         LocalTime close = LocalTime.parse(config.marketCloseTime, TIME_FMT);
         return now.isAfter(open) && now.isBefore(close);
-    }
-
-    private boolean isMarketClosingSoon(LocalTime now) {
-        LocalTime close = LocalTime.parse(config.marketCloseTime, TIME_FMT);
-        return now.isAfter(close.minusMinutes(config.forceExitMinutesBeforeClose));
     }
 
     /**

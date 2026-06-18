@@ -64,7 +64,7 @@ public class TickReplayer {
 
     /** Replay today's recorded ticks. */
     public static void replay(TradeConfig config) throws IOException, KiteException {
-        String today = LocalDate.now().format(DATE_FMT);
+        String today = LocalDate.now().minusDays(0).format(DATE_FMT);
         new TickReplayer(resolveDir(), today).run(config);
     }
 
@@ -76,7 +76,7 @@ public class TickReplayer {
     /** main() for direct execution */
     public static void main(String[] args) throws Exception, KiteException {
         TradeConfig config = TradeConfig.defaultConfig();
-        String date = args.length > 0 ? args[0] : LocalDate.now().format(DATE_FMT);
+        String date = args.length > 0 ? args[0] : LocalDate.now().minusDays(2).format(DATE_FMT);
         new TickReplayer(resolveDir(), date).run(config);
     }
 
@@ -142,16 +142,31 @@ public class TickReplayer {
             marketData.setSnapshot(snapshot);
 
             // Determine which candles are complete up to this tick's time
-            // so the engine's indicator recomputation sees real OHLC data
+            // so the engine's indicator recomputation sees real OHLC data.
+            //
+            // Bug 4 fix: candlesAvailable must be the SLIDING upper bound (only
+            // candles completed strictly before this tick), and must NOT be
+            // floored at 30 against the full-day candle list. The old
+            // `Math.max(candlesAvailable, Math.max(tick.candleCount, 30))`
+            // forced windowSize >= 30 from the start of the day, which made
+            // buildTrendResult's startIdx = ohlcCandles.size() - n collapse to
+            // (almost) the same fixed slice of the LAST ~30 candles of the
+            // ENTIRE DAY on every tick — so closes/highs/lows (and therefore
+            // BBW) barely changed tick-to-tick (frozen ~0.32%), unlike live
+            // where the rolling buffer genuinely slides forward in time.
+            //
+            // Fix: pass candlesAvailable as-is (the true count of completed
+            // candles up to "now"). buildTrendResult handles the < 30 warm-up
+            // case itself by padding the front with spot-based placeholders,
+            // exactly as the live engine's buffer would look during warm-up.
             LocalTime tickTime = tick.dateTime.toLocalTime();
             int candlesAvailable = (int) ohlcCandles.stream()
                     .filter(c -> c[4] < tickTime.toSecondOfDay()) // c[4] = candle end-epoch seconds
                     .count();
-            int windowSize = Math.max(candlesAvailable, Math.max(tick.candleCount, 30));
 
             // Build fake TrendResult from recorded values (no recomputation)
             TrendConfirmationDetector.TrendResult trend =
-                    buildTrendResult(tick, contracts, ohlcCandles, windowSize);
+                    buildTrendResult(tick, contracts, ohlcCandles, candlesAvailable);
 
             // Skip FLAT ticks (engine would have been skipped in live too)
             if (trend.isFlat()) {
@@ -283,35 +298,44 @@ public class TickReplayer {
             List<double[]> ohlcCandles, int windowSize) {
 
         // Use real candle OHLC data for the closes/highs/lows arrays.
-        // windowSize = how many completed candles exist up to this tick.
-        int n = Math.min(windowSize, ohlcCandles.size());
-        n = Math.max(n, 30); // engine needs ≥ 30 for most indicator paths
+        //
+        // windowSize = number of candles completed strictly before this tick
+        // (the true "now" boundary — see Bug 4 fix in run()).
+        //
+        // Bug 4 fix (cont'd): the available candle set is ohlcCandles[0:available],
+        // NOT ohlcCandles[ohlcCandles.size()-n : ohlcCandles.size()] — the old code
+        // sliced from the END OF THE FULL-DAY LIST regardless of windowSize, so
+        // early-session ticks "saw" late-session candles and the window barely
+        // moved across the whole replay (BBW frozen ~0.32%).
+        //
+        // The engine needs >= 30 candles for most indicator paths, so we still
+        // produce an array of at least 30, but pad the FRONT with synthetic
+        // placeholders during warm-up (mirroring live, where the rolling buffer
+        // is genuinely short early in the day) rather than borrowing real
+        // candles from later in the session.
+        int available = Math.min(windowSize, ohlcCandles.size());
+        int n = Math.max(available, 30);
 
         double[] closes = new double[n];
         double[] highs  = new double[n];
         double[] lows   = new double[n];
 
-        if (!ohlcCandles.isEmpty()) {
-            // Take the most recent 'n' completed candles
-            int startIdx = Math.max(0, ohlcCandles.size() - n);
-            int filled   = 0;
-            for (int i = startIdx; i < ohlcCandles.size() && filled < n; i++, filled++) {
-                double[] c  = ohlcCandles.get(i);
-                closes[filled] = c[3]; // close
-                highs[filled]  = c[1]; // high
-                lows[filled]   = c[2]; // low
-            }
-            // If fewer real candles than n, pad the front with spot (warm-up guard)
-            for (int i = filled; i < n; i++) {
-                closes[i] = tick.niftySpot;
-                highs[i]  = tick.niftySpot + 5;
-                lows[i]   = tick.niftySpot - 5;
-            }
-        } else {
-            // Fallback: no candle data — fill flat (original behaviour)
-            Arrays.fill(closes, tick.niftySpot);
-            Arrays.fill(highs,  tick.niftySpot + 5);
-            Arrays.fill(lows,   tick.niftySpot - 5);
+        int pad = n - available; // number of synthetic warm-up candles at the front
+
+        // Front-pad with spot-based placeholders (warm-up guard)
+        for (int i = 0; i < pad; i++) {
+            closes[i] = tick.niftySpot;
+            highs[i]  = tick.niftySpot + 5;
+            lows[i]   = tick.niftySpot - 5;
+        }
+
+        // Fill the remaining slots with the 'available' most-recent completed
+        // candles, in chronological order: ohlcCandles[0 : available]
+        for (int i = 0; i < available; i++) {
+            double[] c = ohlcCandles.get(i);
+            closes[pad + i] = c[3]; // close
+            highs[pad + i]  = c[1]; // high
+            lows[pad + i]   = c[2]; // low
         }
 
         // Use the recorded verdict to determine TRENDING vs FLAT

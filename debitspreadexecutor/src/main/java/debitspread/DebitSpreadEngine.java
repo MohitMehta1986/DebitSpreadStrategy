@@ -840,27 +840,31 @@ public class DebitSpreadEngine {
 
         Logger.info(String.format(
                 "[OK] %s ENTERED | Long=%.0f@₹%.2f | Short=%.0f@₹%.2f | NetDebit=₹%.2f | " +
-                        "MaxProfit=₹%.2f | MaxLoss=₹%.2f | Trail arms at %.0f%% of max (₹%.0f)",
+                        "MaxProfit=₹%.2f | MaxLoss=₹%.2f | HardSL=₹-600 | Trail activates at peak≥₹%.0f (gap ₹%.0f)",
                 direction,
                 legs.longLeg.getStrikePrice(),  longFill.getEntryPrice(),
                 legs.shortLeg.getStrikePrice(), shortFill.getEntryPrice(),
                 actualDebit * effectiveQty,
                 spreadPosition.getMaxProfitAmount(),
                 spreadPosition.getMaxLossAmount(),
-                TRAIL_STEPS_PCT[0][0],
-                spreadPosition.getMaxProfitAmount() * TRAIL_STEPS_PCT[0][0] / 100.0
+                TRAIL_ACTIVATION_THRESHOLD, TRAIL_GAP
         ));
     }
 
     private void logMonitorStatus(double pnl, double profitPct,
                                   double exitFloor, double longLtp, double shortLtp) {
-        String trend     = pnl >= 0 ? "▲" : "▼";
-        double armAt     = spreadPosition.getMaxProfitAmount() * TRAIL_STEPS_PCT[0][0] / 100.0;
-        String trailInfo = trailFloor == Double.NEGATIVE_INFINITY
-                ? String.format("Trail=ARMED@₹%.0f (need ₹%.0f more, hold=%d/%d)",
-                armAt, Math.max(armAt - peakPnl, 0), holdTickCount, MIN_HOLD_TICKS)
-                : String.format("Trail=LOCKED | Floor=₹%.0f | Peak=₹%.0f",
-                trailFloor, peakPnl);
+        String trend = pnl >= 0 ? "▲" : "▼";
+        String trailInfo;
+        if (trailFloor == Double.NEGATIVE_INFINITY) {
+            trailInfo = String.format("Trail=PHASE1 | HardSL only | Peak=₹%.0f | Need ₹%.0f more to activate",
+                    peakPnl, Math.max(TRAIL_ACTIVATION_THRESHOLD - peakPnl, 0));
+        } else if (holdTickCount < MIN_HOLD_TICKS) {
+            trailInfo = String.format("Trail=PHASE2/ARMING | Floor=₹%.0f | hold=%d/%d",
+                    trailFloor, holdTickCount, MIN_HOLD_TICKS);
+        } else {
+            trailInfo = String.format("Trail=PHASE2/ACTIVE | Floor=₹%.0f | Peak=₹%.0f | Gap=₹%.0f",
+                    trailFloor, peakPnl, TRAIL_GAP);
+        }
 
         Logger.info(String.format(
                 "📊 %s %s | LTP Long=₹%.2f Short=₹%.2f | PnL=₹%.2f (%+.0f%%) | Floor=₹%.0f | %s | Rev=%d/2",
@@ -893,11 +897,16 @@ public class DebitSpreadEngine {
             { 60.0, 50.0 },   // crossed 60% of max → floor = 50%
             { 75.0, 65.0 },   // crossed 75% of max → floor = 65%
     };
-    private static final double MAX_PROFIT_CAP = 2000.0;  // exit immediately at ₹1500
+    private static final double MAX_PROFIT_CAP = 3000;  // exit immediately at ₹2000
     private static final int    MIN_HOLD_TICKS = 3;       // trail cannot fire before this many monitor ticks
 
+    /** Phase 1→2 threshold: trail is inactive until peak PnL crosses this level. */
+    private static final double TRAIL_ACTIVATION_THRESHOLD = 1000.0;
+    /** Trailing gap once active: floor = peakPnl − TRAIL_GAP (floor only ever rises). */
+    private static final double TRAIL_GAP = 600.0;
+
     private double peakPnl      = 0.0;
-    private double trailFloor   = Double.NEGATIVE_INFINITY;  // -∞ = trail not armed
+    private double trailFloor   = Double.NEGATIVE_INFINITY;  // -∞ = trail not yet activated
     private int    holdTickCount = 0;  // incremented each monitorAndExit tick; trail blocked until MIN_HOLD_TICKS
 
     // ── IN_TRADE — Monitor and exit ───────────────────────────────────────────
@@ -930,42 +939,52 @@ public class DebitSpreadEngine {
         // ── FIX 04: MIN_HOLD_TICKS guard — trail cannot fire in first N ticks ──
         holdTickCount++;
 
-        // ── Ratchet trail floor up when new PnL peak hit ──────────────────────
-        // FIX 04: triggers are now % of maxProfitAmount (not fixed ₹ values).
-        // Also retains the 40% dynamic floor from Fix 2, which now supplements the
-        // %-based step table the same way it did the old ₹ table.
-//        if (pnl > peakPnl) {
-//            peakPnl = pnl;
-//            double maxProfit     = spreadPosition.getMaxProfitAmount();
-//            double dynamicFloor  = peakPnl * 0.40;   // 40% of peak always preserved
-//            for (double[] step : TRAIL_STEPS_PCT) {
-//                double triggerAmt = maxProfit * step[0] / 100.0;
-//                double floorAmt   = maxProfit * step[1] / 100.0;
-//                if (peakPnl >= triggerAmt) {
-//                    double candidate = Math.max(floorAmt, dynamicFloor);
-//                    if (candidate > trailFloor) {
-//                        double prev = trailFloor == Double.NEGATIVE_INFINITY ? 0 : trailFloor;
-//                        trailFloor  = candidate;
-//                        Logger.info(String.format(
-//                                "[TREND] Trail ratchet | Peak=₹%.0f crossed %.0f%%(₹%.0f) → step=₹%.0f | dyn40%%=₹%.0f → floor ₹%.0f → ₹%.0f",
-//                                peakPnl, step[0], triggerAmt, floorAmt, dynamicFloor, prev, trailFloor));
-//                    }
-//                }
-//            }
-//            // Dynamic floor supplements the step table once trail is armed
-//            if (trailFloor != Double.NEGATIVE_INFINITY && dynamicFloor > trailFloor) {
-//                Logger.info(String.format(
-//                        "[TREND] Trail dyn40%% raised floor | Peak=₹%.0f | dyn=₹%.0f > step floor=₹%.0f",
-//                        peakPnl, dynamicFloor, trailFloor));
-//                trailFloor = dynamicFloor;
-//            }
-//        }
+        // ── Two-phase trailing stop ───────────────────────────────────────────
+        //
+        // PHASE 1 — PnL below ₹1000 peak (let the trade breathe):
+        //   Trail is inactive. Only the hard SL (-₹600 / 50% of max loss) protects.
+        //   trailFloor stays at NEGATIVE_INFINITY so it never interferes.
+        //
+        // PHASE 2 — Peak ≥ ₹1000 (protect profits):
+        //   Trail activates. Floor = peakPnl − ₹650, ratcheting up with every new peak.
+        //   Once activated, floor can only rise — it never pulls back down.
+        //
+        // This lets small early swings play out freely while locking in a meaningful
+        // cushion once the trade has built a real profit base.
 
-        // Hard SL = max of: 50% of max loss OR fixed -₹600 cap (Fix 3: was -₹650)
+        if (pnl > peakPnl) {
+            double prevPeak = peakPnl;
+            peakPnl = pnl;
+
+            if (peakPnl >= TRAIL_ACTIVATION_THRESHOLD) {
+                double newFloor = peakPnl - TRAIL_GAP;
+                if (newFloor > trailFloor) {   // floor can only rise, never fall
+                    double prev = trailFloor == Double.NEGATIVE_INFINITY ? Double.NaN : trailFloor;
+                    trailFloor  = newFloor;
+                    if (Double.isNaN(prev)) {
+                        Logger.info(String.format(
+                                "[TRAIL] 🟢 ACTIVATED | Peak=₹%.0f ≥ ₹%.0f threshold | Floor set to ₹%.0f (peak − ₹%.0f)",
+                                peakPnl, TRAIL_ACTIVATION_THRESHOLD, trailFloor, TRAIL_GAP));
+                    } else {
+                        Logger.info(String.format(
+                                "[TRAIL] Peak ₹%.0f → ₹%.0f | Floor ₹%.0f → ₹%.0f (peak − ₹%.0f)",
+                                prevPeak, peakPnl, prev, trailFloor, TRAIL_GAP));
+                    }
+                }
+            } else {
+                Logger.debug(String.format(
+                        "[TRAIL] Peak=₹%.0f (need ₹%.0f to activate trail) — hard SL only.",
+                        peakPnl, TRAIL_ACTIVATION_THRESHOLD));
+            }
+        }
+
+        // Hard SL = max of: 50% of max loss OR fixed -₹600 cap
         double halfMaxLoss = -(spreadPosition.getMaxLossAmount() * (STOP_LOSS_PCT / 100.0));
-        double hardSl      = Math.max(halfMaxLoss, -600.0);
+        double hardSl      = Math.max(halfMaxLoss, -2000);
 
-        // Effective exit floor = highest of hard SL and trail floor
+        // Effective exit floor:
+        //   Phase 1: hardSl only  (trailFloor = -∞)
+        //   Phase 2: higher of hardSl and trailFloor (trail usually dominates once active)
         double exitFloor = trailFloor == Double.NEGATIVE_INFINITY
                 ? hardSl
                 : Math.max(hardSl, trailFloor);
@@ -1017,8 +1036,8 @@ public class DebitSpreadEngine {
         // ── 5. Trailing stop / hard SL ────────────────────────────────────────
         // FIX 04b: trail cannot fire before MIN_HOLD_TICKS ticks have elapsed.
         // Hard SL (-₹600 / 50%) can still fire immediately to cap catastrophic losses.
-        boolean trailCanFire = (holdTickCount >= MIN_HOLD_TICKS);
-        boolean trailTripped = (trailFloor != Double.NEGATIVE_INFINITY) && pnl <= trailFloor;
+        boolean trailCanFire  = (holdTickCount >= MIN_HOLD_TICKS);
+        boolean trailTripped  = (trailFloor != Double.NEGATIVE_INFINITY) && pnl <= trailFloor;
         boolean hardSlTripped = pnl <= hardSl;
 
         if (hardSlTripped || (trailCanFire && trailTripped)) {

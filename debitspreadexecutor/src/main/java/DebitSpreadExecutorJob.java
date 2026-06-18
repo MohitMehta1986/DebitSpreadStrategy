@@ -44,7 +44,6 @@ public class DebitSpreadExecutorJob implements IJob {
             this.kiteConnect = kiteConnectProvider.getKiteSDKForUserID();
             TradeConfig config = TradeConfig.defaultConfig();
             Logger.info("Config: " + config);
-            PortfolioMonitor monitor = new PortfolioMonitor(config);
 
             engine = new ZerodhaTradeEngine(config, kiteConnect);
         } catch (IOException | KiteException exception) {
